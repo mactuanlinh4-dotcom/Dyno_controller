@@ -1,3 +1,0 @@
-D:/Dyno_system_controller/dyno_s_controller/APP/acs712/acs712.c:3:6:ACS712_Init	24	static
-D:/Dyno_system_controller/dyno_s_controller/APP/acs712/acs712.c:13:6:ACS712_CalibrateZero	32	static
-D:/Dyno_system_controller/dyno_s_controller/APP/acs712/acs712.c:29:7:ACS712_Process	32	static
