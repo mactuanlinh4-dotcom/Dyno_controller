@@ -1,0 +1,28 @@
+# STM32CubeIDE / Keil build outputs
+/Debug/
+/Release/
+/Objects/
+/Listings/
+
+# Executables and binary files
+*.elf
+*.hex
+*.bin
+*.map
+
+# Compiler object and dependency files
+*.o
+*.d
+*.su
+*.stat
+
+# IDE temporary files & User settings
+.settings/
+*.launch
+*.bak
+*.dep
+*.uvoptx
+
+# OS generated files
+.DS_Store
+Thumbs.db
