@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/Dyno_system_controller/dyno_s_controller/build/Debug/cmake_install.cmake",
+		"D:/Dyno_system_controller/dyno_s_controller/build/Debug/cmake/stm32cubemx/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

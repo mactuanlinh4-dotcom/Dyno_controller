@@ -1,0 +1,34 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "STM32G474CEU6 - ST-LINK",
+            "type": "cortex-debug",
+            "request": "launch",
+
+            "cwd": "${workspaceFolder}",
+
+            "executable": "${workspaceFolder}/build/Debug/dyno_s_controller.elf",
+
+            "servertype": "stlink",
+            "interface": "swd",
+
+            "device": "STM32G431CBU6",
+
+            "gdbPath": "E:/STM32CubeCLT_1.22.0/GNU-tools-for-STM32/bin/arm-none-eabi-gdb.exe",
+
+            "serverpath": "E:/STM32CubeCLT_1.22.0/STLink-gdb-server/bin/ST-LINK_gdbserver.exe",
+
+            "stm32cubeprogrammer": "E:/STM32CubeCLT_1.22.0/STM32CubeProgrammer/bin",
+
+            "runToEntryPoint": "main",
+
+            "showDevDebugOutput": "raw",
+
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 5
+            }
+        }
+    ]
+}
