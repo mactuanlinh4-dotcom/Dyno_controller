@@ -46,12 +46,18 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     APP/acs712/acs712.c
+    APP/pid/pid.c
+    APP/pwm_driver/pwm_driver.c
+    APP/usb_comm/usb_comm.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     APP/acs712
+    APP/pid 
+    APP/pwm_driver
+    APP/usb_comm
 )
 
 # Add project symbols (macros)
