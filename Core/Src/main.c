@@ -25,6 +25,8 @@
 #include "acs712.h"
 #include "pwm_driver.h"
 #include "pid.h"
+#include "hx711.h"     /* DÒNG NÀY ĐÃ ĐƯỢC BỔ SUNG ĐỂ SỬA LỖI COMPILER */
+#include "encoder.h"
 #include "usb_comm.h"
 #include <math.h>
 /* USER CODE END Includes */
@@ -41,6 +43,13 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+/* Đặt = 1 để chạy Tool Calib | Đặt = 0 để chạy chương trình chính */
+#define CALIBRATION_MODE        0
+/* Chọn cảm biến cần Calib: 1 = Loadcell 1 (Nén M+), 2 = Loadcell 2 (Kéo M-) */
+#define CALIB_SELECT_SENSOR     1
+/* Đổi khối lượng quả cân chuẩn của ở đây (Ví dụ: 7.425 kg hoặc 1.0 kg) */
+#define KNOWN_WEIGHT_KG         7.425f
 #define ADC_BUF_SIZE            64     
 #define TJ_POD_MAX_CURRENT_A    2.7f   
 #define TJ_POD_MAX_TORQUE_NM    200.0f
@@ -48,9 +57,14 @@ typedef struct {
 #define CONTROL_LOOP_TIME_MS    1
 #define TELEMETRY_TIME_MS       20
 #define BRAKE_TAU_SEC           0.37f
-#define DESIRED_STEP_TIME_SEC   0.40f
+#define DESIRED_STEP_TIME_SEC   0.05f
 #define COIL_RESISTANCE_OHM     8.0f
 #define SUPPLY_VOLTAGE_V        24.0f
+
+/* Cánh tay đòn đặt bằng 1.0m (hoặc thay đổi theo khoảng cách cơ khí thực tế của Dyno) */
+#define DYNO_ARM_1_LENGTH_M     1.0f   /* Cánh tay đòn Loadcell 1 (mét) */
+#define DYNO_ARM_2_LENGTH_M     1.0f   /* Cánh tay đòn Loadcell 2 (mét) */
+#define DYNO_ARM_LENGTH_M       1.0f   /* Tương thích ngược */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,6 +77,7 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN PV */
 uint16_t adc1_dma_buf[ADC_BUF_SIZE];
@@ -70,13 +85,21 @@ uint16_t adc1_dma_buf[ADC_BUF_SIZE];
 ACS712_HandleTypeDef       h_acs712;
 PWM_Driver_HandleTypeDef   h_brake_pwm;
 PID_HandleTypeDef          h_pid_current;
+HX711_HandleTypeDef        h_hx711_1;  /* Loadcell 1 (Bên nén M+) - PA4/PA5 */
+HX711_HandleTypeDef        h_hx711_2;  /* Loadcell 2 (Bên kéo M-) - PB0/PB1 */
+Encoder_HandleTypeDef      h_encoder;
 Target_Boost_HandleTypeDef h_boost = {0.0f, 0.0f, 0.0f, 0};
 
-volatile float g_measured_current_A  = 0.0f;
-volatile float g_measured_current_mA = 0.0f;
-volatile float g_real_torque_Nm      = 0.0f;
-volatile float g_target_current_A    = 0.0f;
-volatile float g_pwm_duty_output     = 0.0f;
+volatile float g_measured_current_A      = 0.0f;
+volatile float g_measured_current_mA     = 0.0f;
+volatile float g_torque_from_current_Nm  = 0.0f; 
+volatile float g_torque_from_loadcell_Nm = 0.0f; /* Tổng mô-men Dyno: M1 - M2 */
+volatile float g_torque_loadcell_1_Nm    = 0.0f; /* Mô-men nhánh 1 (Nén M+) */
+volatile float g_torque_loadcell_2_Nm    = 0.0f; /* Mô-men nhánh 2 (Kéo M-) */
+volatile float g_measured_speed_rpm      = 0.0f;
+volatile float g_mechanical_power_w      = 0.0f;
+volatile float g_target_current_A        = 0.0f;
+volatile float g_pwm_duty_output         = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -85,13 +108,80 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void Run_HX711_Calibration_Tool(HX711_HandleTypeDef *hx, uint8_t sensor_id) {
+    static char msg[128];
 
+    // 1. Lấy mốc Zero khi chưa đặt tải
+    snprintf(msg, sizeof(msg), "\r\n=== HE THONG CALIB LOADCELL %d ===\r\n1. Dang lay moc Zero (Khong dat gi len phanh)...", sensor_id);
+    CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
+    
+    HX711_Tare(hx, 40);
+    
+    snprintf(msg, sizeof(msg), " XONG!\r\n -> ZERO OFFSET: %ld\r\n", hx->offset);
+    HAL_Delay(50);
+    CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
+    HAL_Delay(2000);
+
+    // 2. Yêu cầu đặt quả cân lên
+    snprintf(msg, sizeof(msg), "2. Hay treo/dat qua can %.2f kg len Loadcell %d trong 5 giay...\r\n", KNOWN_WEIGHT_KG, sensor_id);
+    CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
+    
+    for (int i = 5; i > 0; i--) {
+        snprintf(msg, sizeof(msg), " Dem nguoc: %d s\r\n", i);
+        HAL_Delay(50);
+        CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
+        HAL_Delay(4000);
+    }
+
+    // 3. Đọc mẫu có tải để tính Scale Factor
+    snprintf(msg, sizeof(msg), "3. Dang tinh toan Scale Factor Loadcell %d...", sensor_id);
+    HAL_Delay(50);
+    CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
+
+    int64_t sum = 0;
+    uint8_t count = 0;
+    uint32_t step3_timeout = HAL_GetTick();
+
+    while (count < 40) {
+        if (HX711_IsReady(hx)) {
+            sum += HX711_ReadRaw(hx);
+            count++;
+        }
+        /* Bảo vệ chống treo nếu cảm biến tuột dây */
+        if (HAL_GetTick() - step3_timeout > 6000) {
+            snprintf(msg, sizeof(msg), "\r\n[LOI]: Timeout doc HX711! Kiem tra day ket noi.\r\n");
+            CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
+            return;
+        }
+    }
+    int32_t avg_raw = (int32_t)(sum / 40);
+    float calculated_scale = (float)(avg_raw - hx->offset) / KNOWN_WEIGHT_KG;
+
+    // 4. In kết quả cuối cùng
+    static char big_buffer[384]; /* Dùng static và 384 bytes an toàn cho RAM */
+    snprintf(big_buffer, sizeof(big_buffer),
+             " XONG!\r\n\r\n=========================================\r\n"
+             "KET QUA CALIB HOAN TAT CHO LOADCELL %d:\r\n"
+             "-> ZERO OFFSET: %ld\r\n"
+             "-> RAW CO TAI (AVG): %ld\r\n"
+             "-> DELTA ADC (LOAD - ZERO): %ld\r\n"
+             "-> SCALE FACTOR: %.2f\r\n\r\n"
+             "-> HAY COPY DONG SAU VAO FILE hx711.h:\r\n"
+             "#define HX711_%d_SCALE_FACTOR  %.2f\r\n"
+             "=========================================\r\n",
+             sensor_id, hx->offset, avg_raw, (long)(avg_raw - hx->offset), calculated_scale,
+             sensor_id, calculated_scale);
+
+    HAL_Delay(100);
+    CDC_Transmit_FS((uint8_t*)big_buffer, strlen(big_buffer));
+}
 /* USER CODE END 0 */
 
 /**
@@ -108,6 +198,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -127,25 +218,45 @@ int main(void)
   MX_ADC1_Init();
   MX_TIM1_Init();
   MX_USB_Device_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
- HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_dma_buf, ADC_BUF_SIZE);
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_dma_buf, ADC_BUF_SIZE);
 
-  // 2. Khởi tạo Driver cảm biến ACS712 chuẩn khớp theo acs712.h
-  // Tham số: (dev, hadc, dma_buf, buf_size)
   ACS712_Init(&h_acs712, &hadc1, adc1_dma_buf, ADC_BUF_SIZE);
-
-  // 3. Hiệu chỉnh điểm Zero khi chưa đóng tải
   ACS712_CalibrateZero(&h_acs712);
 
-  // 4. Khởi tạo Driver PWM cho Module XY-MOSFET (TIM1_CH1)
   PWM_Driver_Init(&h_brake_pwm, &htim1, TIM_CHANNEL_1);
   PWM_Driver_Start(&h_brake_pwm);
 
-  // 5. Khởi tạo PID Dòng điện (Kp=15.0, Ki=80.0, Kd=0.0, dt=0.001s, out: 0-100%)
   PID_Init(&h_pid_current, 30.0f, 15.0f, 0.0f, 0.001f, 0.0f, 100.0f);
 
-  // 6. Khởi tạo Module USB CDC
+  // Khởi tạo HX711 #1 (Loadcell 1 bên nén M+: DOUT=PA4, SCK=PA5)
+  HX711_Init(&h_hx711_1, GPIOA, GPIO_PIN_4, GPIOA, GPIO_PIN_5, DYNO_ARM_1_LENGTH_M);
+  h_hx711_1.scale_factor = HX711_1_SCALE_FACTOR;
+
+  // Khởi tạo HX711 #2 (Loadcell 2 bên kéo M-: DOUT=PB0, SCK=PB1)
+  HX711_Init(&h_hx711_2, GPIOB, GPIO_PIN_0, GPIOB, GPIO_PIN_1, DYNO_ARM_2_LENGTH_M);
+  h_hx711_2.scale_factor = HX711_2_SCALE_FACTOR;
+
+  // Khởi tạo Encoder đo tốc độ trục phanh (PPR = 2000, 4X = 8000 counts/vòng trên TIM3 PA6/PB5)
+  Encoder_Init(&h_encoder, &htim3, 2000.0f);
+  Encoder_Start(&h_encoder);
+
   USB_Comm_Init();
+
+#if CALIBRATION_MODE
+  HAL_Delay(5000);                      
+#if (CALIB_SELECT_SENSOR == 2)
+  Run_HX711_Calibration_Tool(&h_hx711_2, 2);
+#else
+  Run_HX711_Calibration_Tool(&h_hx711_1, 1);
+#endif
+  while(1);               
+#else
+  HX711_Tare(&h_hx711_1, 20);
+  HX711_Tare(&h_hx711_2, 20);
+#endif
 
   uint32_t last_control_time = HAL_GetTick();
   uint32_t last_telemetry_time = HAL_GetTick();
@@ -158,76 +269,90 @@ int main(void)
     uint32_t current_time = HAL_GetTick();
 
     // =========================================================================
-// VÒNG LẶP ĐIỀU KHIỂN KÍN 1kHz (1ms) - XỬ LÝ AN TOÀN TRẦN 200Nm & DUMP 0Nm
-// =========================================================================
-    if (current_time - last_control_time >= CONTROL_LOOP_TIME_MS){
-     last_control_time = current_time;
+    // VÒNG LẶP ĐIỀU KHIỂN KÍN 1kHz (1ms)
+    // =========================================================================
+    if (current_time - last_control_time >= CONTROL_LOOP_TIME_MS) {
+        last_control_time = current_time;
 
-     // 1. Đọc dòng thực tế từ ACS712 và tính mô-men hiện tại
-     g_measured_current_A = ACS712_Process(&h_acs712);
-     g_measured_current_mA = g_measured_current_A * 1000.0f;
-     g_real_torque_Nm = g_measured_current_A * TORQUE_TO_CURRENT_KT;
+        g_measured_current_A = ACS712_Process(&h_acs712);
+        g_measured_current_mA = g_measured_current_A * 1000.0f;
+        g_torque_from_current_Nm = g_measured_current_A * TORQUE_TO_CURRENT_KT;
 
-     // 2. KỊCH BẢN XẢ VỀ 0: Set T = 0 Nm -> Khóa PWM ngay lập tức
-     if (g_target_torque_Nm <= 0.0f) {
-        PWM_Driver_SetDutyCycle(&h_brake_pwm, 0.0f);
-        PID_Reset(&h_pid_current);
-        h_boost.is_boosting = 0;
-        g_pwm_duty_output = 0.0f;
-      }
-    else {
-        // 3. Phát hiện bước nhảy mô-men đặt mới
-        if (fabsf(g_target_torque_Nm - h_boost.T_target) > 1.0f) {
-            h_boost.T_start = g_real_torque_Nm;
-            h_boost.T_target = g_target_torque_Nm;
-            
-            // Tính toán T_boost ảo (Hàm này tự động Clamping tối đa 200 Nm)
-            h_boost.T_boost = Calculate_Boost_Torque(h_boost.T_start, h_boost.T_target, 0.40f, 0.37f);
-            h_boost.is_boosting = 1;
-        }
+        HX711_Process(&h_hx711_1);
+        HX711_Process(&h_hx711_2);
+        g_torque_loadcell_1_Nm = h_hx711_1.measured_torque_nm;
+        g_torque_loadcell_2_Nm = h_hx711_2.measured_torque_nm;
 
-        // 4. CHỐNG VỌT LỐ: Giám sát điểm cắt (Cutoff Threshold)
-        float active_target_Nm = h_boost.T_target;
+        /* Tổng mô-men Dyno từ 2 loadcell đối xứng:
+         * Loadcell 1 bị nén: M1 = M(+) > 0
+         * Loadcell 2 bị kéo: M2 = M(-) < 0
+         * => Mô-men thực tế: M_total = M(+) - M(-) = M1 - M2
+         * Ví dụ: M1 = +10 Nm, M2 = -10 Nm => M_total = 10 - (-10) = 20 Nm
+         * Nếu chỉ gắn 1 cảm biến (cảm biến 2 chưa gắn), M2 = 0 => M_total = M1
+         */
+        g_torque_from_loadcell_Nm = g_torque_loadcell_1_Nm - g_torque_loadcell_2_Nm;
 
-        if (h_boost.is_boosting) {
-            active_target_Nm = h_boost.T_boost; 
-
-            // Nếu target = 200Nm hoặc T_boost bị kẹp ở 200Nm: 
-            // Ngắt Boost ngay khi dòng đo đạt 96% của Target thật (tránh vọt lố)
-            if ((h_boost.T_target > h_boost.T_start && g_real_torque_Nm >= h_boost.T_target * 0.96f) ||
-                (h_boost.T_target < h_boost.T_start && g_real_torque_Nm <= h_boost.T_target * 1.04f)) 
-            {
-                h_boost.is_boosting = 0; // Tắt Boost, trả lại cho PID
-                active_target_Nm = h_boost.T_target;
-                
-                // Pre-load tích phân PID bằng điện áp duy trì xác lập chuẩn
-                float target_I = h_boost.T_target / TORQUE_TO_CURRENT_KT;
-                h_pid_current.integrator = (target_I * COIL_RESISTANCE_OHM / SUPPLY_VOLTAGE_V) * 100.0f;
+        if (g_target_torque_Nm <= 0.0f) {
+            PWM_Driver_SetDutyCycle(&h_brake_pwm, 0.0f);
+            PID_Reset(&h_pid_current);
+            h_boost.is_boosting = 0;
+            h_boost.T_target = 0.0f;
+            g_pwm_duty_output = 0.0f;
+        } 
+        else {
+            if (fabsf(g_target_torque_Nm - h_boost.T_target) > 1.0f) {
+                h_boost.T_start = g_torque_from_current_Nm;
+                h_boost.T_target = g_target_torque_Nm;
+                h_boost.T_boost = Calculate_Boost_Torque(h_boost.T_start, h_boost.T_target, DESIRED_STEP_TIME_SEC, BRAKE_TAU_SEC);
+                h_boost.is_boosting = 1;
+            } else {
+              h_boost.T_target = g_target_torque_Nm;
             }
+
+            float active_target_Nm = h_boost.T_target;
+
+            if (h_boost.is_boosting) {
+                active_target_Nm = h_boost.T_boost; 
+
+                if ((h_boost.T_target > h_boost.T_start && g_torque_from_current_Nm >= h_boost.T_target * 0.96f) ||
+                    (h_boost.T_target < h_boost.T_start && g_torque_from_current_Nm <= h_boost.T_target * 1.04f)) 
+                {
+                    h_boost.is_boosting = 0;
+                    active_target_Nm = h_boost.T_target;
+                    
+                    float target_I = h_boost.T_target / TORQUE_TO_CURRENT_KT;
+                    h_pid_current.integrator = (target_I * COIL_RESISTANCE_OHM / SUPPLY_VOLTAGE_V) * 100.0f;
+                }
+            }
+
+            g_target_current_A = active_target_Nm / TORQUE_TO_CURRENT_KT;
+            if (g_target_current_A > TJ_POD_MAX_CURRENT_A) g_target_current_A = TJ_POD_MAX_CURRENT_A;
+
+            g_pwm_duty_output = PID_Compute(&h_pid_current, g_target_current_A, g_measured_current_A);
+            PWM_Driver_SetDutyCycle(&h_brake_pwm, g_pwm_duty_output);
         }
-
-        // 5. Tính toán dòng đặt cho PID
-        g_target_current_A = active_target_Nm / TORQUE_TO_CURRENT_KT;
-        if (g_target_current_A > TJ_POD_MAX_CURRENT_A) g_target_current_A = TJ_POD_MAX_CURRENT_A;
-
-        // 6. Tính toán PID & Xuất Duty PWM
-        g_pwm_duty_output = PID_Compute(&h_pid_current, g_target_current_A, g_measured_current_A);
-        PWM_Driver_SetDutyCycle(&h_brake_pwm, g_pwm_duty_output);
-      }
     }
 
     // =========================================================================
-    // KHỐI 2: TRUYỀN DỮ LIỆU TELEMETRY VỀ PC / EXCEL (Tần số 50Hz - Chu kỳ 20ms)
+    // KHỐI TELEMETRY 50Hz (20ms) - CẬP NHẬT TỐC ĐỘ ENCODER & GỬI DỮ LIỆU
     // =========================================================================
-    if (current_time - last_telemetry_time >= TELEMETRY_TIME_MS)
-    {
-      last_telemetry_time = current_time;
+    if (current_time - last_telemetry_time >= TELEMETRY_TIME_MS) {
+        uint32_t dt_ms = current_time - last_telemetry_time;
+        last_telemetry_time = current_time;
 
-      // Tính Mô-men thực tế phản hồi từ dòng điện đo được
-      g_real_torque_Nm = g_measured_current_A * TORQUE_TO_CURRENT_KT;
+        /* Tính toán tốc độ quay RPM và Công suất cơ học */
+        float active_torque = (fabsf(g_torque_from_loadcell_Nm) > 0.01f) ? fabsf(g_torque_from_loadcell_Nm) : g_torque_from_current_Nm;
+        Encoder_Process(&h_encoder, (float)dt_ms, active_torque);
 
-      // Đẩy chuỗi dữ liệu CSV (Current_mA, Torque_Nm, Duty_Percent) qua USB Type-C
-      USB_Comm_SendTelemetry(g_measured_current_mA, g_real_torque_Nm, g_pwm_duty_output);
+        g_measured_speed_rpm = Encoder_GetRPM(&h_encoder);
+        g_mechanical_power_w = Encoder_GetPower(&h_encoder);
+
+        USB_Comm_SendTelemetry(g_measured_current_mA, 
+                               g_torque_from_current_Nm, 
+                               g_torque_from_loadcell_Nm, 
+                               g_pwm_duty_output,
+                               g_measured_speed_rpm,
+                               g_mechanical_power_w);
     }
     /* USER CODE END WHILE */
 
@@ -438,6 +563,55 @@ static void MX_TIM1_Init(void)
 }
 
 /**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 65535;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 10;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 10;
+  if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -461,6 +635,7 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -468,6 +643,37 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PA4 (HX711 #1 DOUT) */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA5 (HX711 #1 SCK) */
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB0 (HX711 #2 DOUT) */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB1 (HX711 #2 SCK) */
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 

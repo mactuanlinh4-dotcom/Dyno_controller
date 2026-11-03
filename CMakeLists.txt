@@ -49,6 +49,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     APP/pid/pid.c
     APP/pwm_driver/pwm_driver.c
     APP/usb_comm/usb_comm.c
+    APP/hx711/hx711.c
+    APP/encoder/encoder.c
 )
 
 # Add include paths
@@ -58,6 +60,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     APP/pid 
     APP/pwm_driver
     APP/usb_comm
+    APP/hx711
+    APP/encoder
 )
 
 # Add project symbols (macros)
