@@ -93,9 +93,9 @@ Target_Boost_HandleTypeDef h_boost = {0.0f, 0.0f, 0.0f, 0};
 volatile float g_measured_current_A      = 0.0f;
 volatile float g_measured_current_mA     = 0.0f;
 volatile float g_torque_from_current_Nm  = 0.0f; 
-volatile float g_torque_from_loadcell_Nm = 0.0f; /* Tổng mô-men Dyno: M1 - M2 */
-volatile float g_torque_loadcell_1_Nm    = 0.0f; /* Mô-men nhánh 1 (Nén M+) */
-volatile float g_torque_loadcell_2_Nm    = 0.0f; /* Mô-men nhánh 2 (Kéo M-) */
+volatile float g_torque_from_loadcell_Nm = 0.0f; /* Tổng mô-men Dyno: |M1| + |M2| (Tự động chống ngược) */
+volatile float g_torque_loadcell_1_Nm    = 0.0f; /* Mô-men nhánh 1 */
+volatile float g_torque_loadcell_2_Nm    = 0.0f; /* Mô-men nhánh 2 */
 volatile float g_measured_speed_rpm      = 0.0f;
 volatile float g_mechanical_power_w      = 0.0f;
 volatile float g_target_current_A        = 0.0f;
@@ -283,14 +283,13 @@ int main(void)
         g_torque_loadcell_1_Nm = h_hx711_1.measured_torque_nm;
         g_torque_loadcell_2_Nm = h_hx711_2.measured_torque_nm;
 
-        /* Tổng mô-men Dyno từ 2 loadcell đối xứng:
-         * Loadcell 1 bị nén: M1 = M(+) > 0
-         * Loadcell 2 bị kéo: M2 = M(-) < 0
-         * => Mô-men thực tế: M_total = M(+) - M(-) = M1 - M2
-         * Ví dụ: M1 = +10 Nm, M2 = -10 Nm => M_total = 10 - (-10) = 20 Nm
-         * Nếu chỉ gắn 1 cảm biến (cảm biến 2 chưa gắn), M2 = 0 => M_total = M1
+        /* Tổng mô-men Dyno từ 2 loadcell đối xứng (Tự động chống ngược chiều):
+         * Sử dụng tổng biên độ lực cản: M_total = |M1| + |M2|
+         * - Bất chấp cắm Loadcell nào vào kênh 1 hay kênh 2.
+         * - Bất chấp động cơ quay thuận hay quay nghịch.
+         * - Nếu chỉ cắm 1 Loadcell (kênh còn lại rút dây), kênh đó = 0 => M_total = |M1|.
          */
-        g_torque_from_loadcell_Nm = g_torque_loadcell_1_Nm - g_torque_loadcell_2_Nm;
+        g_torque_from_loadcell_Nm = fabsf(g_torque_loadcell_1_Nm) + fabsf(g_torque_loadcell_2_Nm);
 
         if (g_target_torque_Nm <= 0.0f) {
             PWM_Driver_SetDutyCycle(&h_brake_pwm, 0.0f);
