@@ -26,6 +26,7 @@ void HX711_Init(HX711_HandleTypeDef *hx,
     hx->measured_torque_nm = 0.0f;
     hx->is_ready           = 0;
     hx->is_connected       = 0;
+    hx->last_ready_tick    = HAL_GetTick();
 
     HAL_GPIO_WritePin(hx->sck_port, hx->sck_pin, GPIO_PIN_RESET);
 }
@@ -100,8 +101,16 @@ void HX711_Tare(HX711_HandleTypeDef *hx, uint8_t samples) {
 
 void HX711_Process(HX711_HandleTypeDef *hx) {
     if (!HX711_IsReady(hx)) {
+        // Đứt dây DOUT (pull-up giữ mức cao) => không bao giờ Ready
+        if (HAL_GetTick() - hx->last_ready_tick > HX711_TIMEOUT_MS) {
+            hx->is_connected       = 0;
+            hx->filtered_weight_kg = 0.0f;
+            hx->measured_force_n   = 0.0f;
+            hx->measured_torque_nm = 0.0f;
+        }
         return;
     }
+    hx->last_ready_tick = HAL_GetTick();
 
     // Bảo vệ chống lỗi chia cho 0
     if (hx->scale_factor > -1.0f && hx->scale_factor < 1.0f) {

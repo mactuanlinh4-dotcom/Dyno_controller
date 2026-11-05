@@ -28,7 +28,10 @@
 #include "hx711.h"     /* DÒNG NÀY ĐÃ ĐƯỢC BỔ SUNG ĐỂ SỬA LỖI COMPILER */
 #include "encoder.h"
 #include "usb_comm.h"
+#include "road_load.h"
 #include <math.h>
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -38,6 +41,7 @@ typedef struct {
     float T_target;
     float T_boost;
     uint8_t is_boosting;
+    uint32_t start_tick;
 } Target_Boost_HandleTypeDef;
 /* USER CODE END PTD */
 
@@ -60,11 +64,27 @@ typedef struct {
 #define DESIRED_STEP_TIME_SEC   0.05f
 #define COIL_RESISTANCE_OHM     8.0f
 #define SUPPLY_VOLTAGE_V        24.0f
+/* Thời gian boost tối đa, tránh kẹt boost khi nhiễu dòng không cho đạt ngưỡng thoát */
+#define BOOST_MAX_TIME_MS       250
+/* Failsafe: quá thời gian này không nhận lệnh => nhả phanh. 0 = tắt
+ * (Khi bật, phần mềm PC phải gửi lại lệnh T định kỳ) */
+#define CMD_TIMEOUT_MS          0
 
-/* Cánh tay đòn đặt bằng 1.0m (hoặc thay đổi theo khoảng cách cơ khí thực tế của Dyno) */
-#define DYNO_ARM_1_LENGTH_M     1.0f   /* Cánh tay đòn Loadcell 1 (mét) */
-#define DYNO_ARM_2_LENGTH_M     1.0f   /* Cánh tay đòn Loadcell 2 (mét) */
-#define DYNO_ARM_LENGTH_M       1.0f   /* Tương thích ngược */
+/* Cánh tay đòn: khoảng cách từ tâm cảm biến lực đến tâm phanh bột từ = 198 mm
+ * Mô-men phanh đo được: T = F_loadcell * L */
+#define DYNO_ARM_1_LENGTH_M     0.198f /* Cánh tay đòn Loadcell 1 (mét) */
+#define DYNO_ARM_2_LENGTH_M     0.198f /* Cánh tay đòn Loadcell 2 (mét) */
+#define DYNO_ARM_LENGTH_M       0.198f /* Tương thích ngược */
+
+/* Vòng kín mô-men (vòng ngoài): so mô-men đo từ loadcell với giá trị đặt,
+ * cộng phần hiệu chỉnh vào mô-men đặt cho vòng dòng (vòng trong).
+ * T_cmd = T_set + PI(T_ref - T_loadcell)
+ * T_ref: mô-men kỳ vọng = T_set qua khâu trễ bậc 1 (trễ từ phanh + lọc loadcell),
+ * để PI chỉ bù sai số xác lập (Kt lệch, nhiệt độ...) mà không bị vọt lố do trễ */
+#define TORQUE_LOOP_KP          0.5f
+#define TORQUE_LOOP_KI          4.0f   /* 1/s */
+#define TORQUE_LOOP_LC_TAU_SEC  0.12f  /* Trễ do lọc EMA loadcell (~80 SPS, alpha 0.1) */
+#define TORQUE_LOOP_CORR_MAX_NM 50.0f  /* Giới hạn phần hiệu chỉnh */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -85,10 +105,12 @@ uint16_t adc1_dma_buf[ADC_BUF_SIZE];
 ACS712_HandleTypeDef       h_acs712;
 PWM_Driver_HandleTypeDef   h_brake_pwm;
 PID_HandleTypeDef          h_pid_current;
+PID_HandleTypeDef          h_pid_torque;   /* Vòng ngoài: mô-men loadcell */
 HX711_HandleTypeDef        h_hx711_1;  /* Loadcell 1 (Bên nén M+) - PA4/PA5 */
 HX711_HandleTypeDef        h_hx711_2;  /* Loadcell 2 (Bên kéo M-) - PB0/PB1 */
 Encoder_HandleTypeDef      h_encoder;
-Target_Boost_HandleTypeDef h_boost = {0.0f, 0.0f, 0.0f, 0};
+RoadLoad_HandleTypeDef     h_road_load;
+Target_Boost_HandleTypeDef h_boost = {0.0f, 0.0f, 0.0f, 0, 0};
 
 volatile float g_measured_current_A      = 0.0f;
 volatile float g_measured_current_mA     = 0.0f;
@@ -100,6 +122,7 @@ volatile float g_measured_speed_rpm      = 0.0f;
 volatile float g_mechanical_power_w      = 0.0f;
 volatile float g_target_current_A        = 0.0f;
 volatile float g_pwm_duty_output         = 0.0f;
+volatile float g_torque_ref_Nm           = 0.0f; /* Mô-men kỳ vọng cho vòng kín loadcell */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -130,7 +153,9 @@ void Run_HX711_Calibration_Tool(HX711_HandleTypeDef *hx, uint8_t sensor_id) {
     HAL_Delay(2000);
 
     // 2. Yêu cầu đặt quả cân lên
-    snprintf(msg, sizeof(msg), "2. Hay treo/dat qua can %.2f kg len Loadcell %d trong 5 giay...\r\n", KNOWN_WEIGHT_KG, sensor_id);
+    char str_weight[16];
+    Format_Float(str_weight, sizeof(str_weight), KNOWN_WEIGHT_KG, 2);
+    snprintf(msg, sizeof(msg), "2. Hay treo/dat qua can %s kg len Loadcell %d trong 5 giay...\r\n", str_weight, sensor_id);
     CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
     
     for (int i = 5; i > 0; i--) {
@@ -163,6 +188,8 @@ void Run_HX711_Calibration_Tool(HX711_HandleTypeDef *hx, uint8_t sensor_id) {
     }
     int32_t avg_raw = (int32_t)(sum / 40);
     float calculated_scale = (float)(avg_raw - hx->offset) / KNOWN_WEIGHT_KG;
+    char str_scale[24];
+    Format_Float(str_scale, sizeof(str_scale), calculated_scale, 2);
 
     // 4. In kết quả cuối cùng
     static char big_buffer[384]; /* Dùng static và 384 bytes an toàn cho RAM */
@@ -172,12 +199,12 @@ void Run_HX711_Calibration_Tool(HX711_HandleTypeDef *hx, uint8_t sensor_id) {
              "-> ZERO OFFSET: %ld\r\n"
              "-> RAW CO TAI (AVG): %ld\r\n"
              "-> DELTA ADC (LOAD - ZERO): %ld\r\n"
-             "-> SCALE FACTOR: %.2f\r\n\r\n"
+             "-> SCALE FACTOR: %s\r\n\r\n"
              "-> HAY COPY DONG SAU VAO FILE hx711.h:\r\n"
-             "#define HX711_%d_SCALE_FACTOR  %.2f\r\n"
+             "#define HX711_%d_SCALE_FACTOR  %sf\r\n"
              "=========================================\r\n",
-             sensor_id, hx->offset, avg_raw, (long)(avg_raw - hx->offset), calculated_scale,
-             sensor_id, calculated_scale);
+             sensor_id, (long)hx->offset, (long)avg_raw, (long)(avg_raw - hx->offset), str_scale,
+             sensor_id, str_scale);
 
     HAL_Delay(100);
     CDC_Transmit_FS((uint8_t*)big_buffer, strlen(big_buffer));
@@ -230,6 +257,8 @@ int main(void)
   PWM_Driver_Start(&h_brake_pwm);
 
   PID_Init(&h_pid_current, 30.0f, 15.0f, 0.0f, 0.001f, 0.0f, 100.0f);
+  PID_Init(&h_pid_torque, TORQUE_LOOP_KP, TORQUE_LOOP_KI, 0.0f, 0.001f,
+           -TORQUE_LOOP_CORR_MAX_NM, TORQUE_LOOP_CORR_MAX_NM);
 
   // Khởi tạo HX711 #1 (Loadcell 1 bên nén M+: DOUT=PA4, SCK=PA5)
   HX711_Init(&h_hx711_1, GPIOA, GPIO_PIN_4, GPIOA, GPIO_PIN_5, DYNO_ARM_1_LENGTH_M);
@@ -242,6 +271,8 @@ int main(void)
   // Khởi tạo Encoder đo tốc độ trục phanh (PPR = 2000, 4X = 8000 counts/vòng trên TIM3 PA6/PB5)
   Encoder_Init(&h_encoder, &htim3, 2000.0f);
   Encoder_Start(&h_encoder);
+
+  RoadLoad_Init(&h_road_load, ROAD_LOAD_DEFAULT_MASS_KG, ROAD_LOAD_DEFAULT_RADIUS_M);
 
   USB_Comm_Init();
 
@@ -258,6 +289,8 @@ int main(void)
   HX711_Tare(&h_hx711_2, 20);
 #endif
 
+  uint32_t last_cmd_time = HAL_GetTick();
+  (void)last_cmd_time; /* Chỉ dùng khi CMD_TIMEOUT_MS > 0 */
   uint32_t last_control_time = HAL_GetTick();
   uint32_t last_telemetry_time = HAL_GetTick();
   /* USER CODE END 2 */
@@ -274,8 +307,10 @@ int main(void)
     if (current_time - last_control_time >= CONTROL_LOOP_TIME_MS) {
         last_control_time = current_time;
 
+        /* Dòng lọc nhanh cho PID, dòng lọc mượt cho hiển thị */
         g_measured_current_A = ACS712_Process(&h_acs712);
-        g_measured_current_mA = g_measured_current_A * 1000.0f;
+        ACS712_AutoZero(&h_acs712, (g_pwm_duty_output <= 0.0f) ? 1 : 0);
+        g_measured_current_mA = ACS712_GetDisplayCurrent(&h_acs712) * 1000.0f;
         g_torque_from_current_Nm = g_measured_current_A * TORQUE_TO_CURRENT_KT;
 
         HX711_Process(&h_hx711_1);
@@ -291,21 +326,39 @@ int main(void)
          */
         g_torque_from_loadcell_Nm = fabsf(g_torque_loadcell_1_Nm) + fabsf(g_torque_loadcell_2_Nm);
 
+        /* Failsafe: mất kết nối USB (hoặc quá hạn lệnh) => nhả phanh */
+        if (g_cmd_received_flag) {
+            g_cmd_received_flag = 0;
+            last_cmd_time = current_time;
+        }
+        if (!USB_Comm_IsConnected()
+#if (CMD_TIMEOUT_MS > 0)
+            || (current_time - last_cmd_time > CMD_TIMEOUT_MS)
+#endif
+           ) {
+            g_target_torque_Nm = 0.0f;
+        }
+
         if (g_target_torque_Nm <= 0.0f) {
             PWM_Driver_SetDutyCycle(&h_brake_pwm, 0.0f);
             PID_Reset(&h_pid_current);
+            PID_Reset(&h_pid_torque);
+            g_torque_ref_Nm = fabsf(g_torque_from_loadcell_Nm);
             h_boost.is_boosting = 0;
             h_boost.T_target = 0.0f;
             g_pwm_duty_output = 0.0f;
         } 
         else {
-            if (fabsf(g_target_torque_Nm - h_boost.T_target) > 1.0f) {
+            /* Chế độ mô phỏng: mô-men thay đổi liên tục => không dùng boost bước nhảy */
+            if (!g_road_sim_enabled && fabsf(g_target_torque_Nm - h_boost.T_target) > 1.0f) {
                 h_boost.T_start = g_torque_from_current_Nm;
                 h_boost.T_target = g_target_torque_Nm;
                 h_boost.T_boost = Calculate_Boost_Torque(h_boost.T_start, h_boost.T_target, DESIRED_STEP_TIME_SEC, BRAKE_TAU_SEC);
                 h_boost.is_boosting = 1;
+                h_boost.start_tick = current_time;
             } else {
               h_boost.T_target = g_target_torque_Nm;
+              if (g_road_sim_enabled) h_boost.is_boosting = 0;
             }
 
             float active_target_Nm = h_boost.T_target;
@@ -314,7 +367,8 @@ int main(void)
                 active_target_Nm = h_boost.T_boost; 
 
                 if ((h_boost.T_target > h_boost.T_start && g_torque_from_current_Nm >= h_boost.T_target * 0.96f) ||
-                    (h_boost.T_target < h_boost.T_start && g_torque_from_current_Nm <= h_boost.T_target * 1.04f)) 
+                    (h_boost.T_target < h_boost.T_start && g_torque_from_current_Nm <= h_boost.T_target * 1.04f) ||
+                    (current_time - h_boost.start_tick > BOOST_MAX_TIME_MS))
                 {
                     h_boost.is_boosting = 0;
                     active_target_Nm = h_boost.T_target;
@@ -322,6 +376,20 @@ int main(void)
                     float target_I = h_boost.T_target / TORQUE_TO_CURRENT_KT;
                     h_pid_current.integrator = (target_I * COIL_RESISTANCE_OHM / SUPPLY_VOLTAGE_V) * 100.0f;
                 }
+            }
+
+            /* Vòng kín mô-men theo loadcell: chỉ chạy khi hết boost và có cảm biến */
+            float T_meas_Nm = fabsf(g_torque_from_loadcell_Nm);
+            if (!h_boost.is_boosting && (h_hx711_1.is_connected || h_hx711_2.is_connected)) {
+                g_torque_ref_Nm += (h_boost.T_target - g_torque_ref_Nm) *
+                                 ((CONTROL_LOOP_TIME_MS * 0.001f) / (BRAKE_TAU_SEC + TORQUE_LOOP_LC_TAU_SEC));
+                float corr_Nm = PID_Compute(&h_pid_torque, g_torque_ref_Nm, T_meas_Nm);
+                active_target_Nm = h_boost.T_target + corr_Nm;
+                if (active_target_Nm < 0.0f) active_target_Nm = 0.0f;
+            } else {
+                /* Bắt đầu mô hình kỳ vọng từ giá trị đo thực tế */
+                g_torque_ref_Nm = T_meas_Nm;
+                PID_Reset(&h_pid_torque);
             }
 
             g_target_current_A = active_target_Nm / TORQUE_TO_CURRENT_KT;
@@ -343,15 +411,27 @@ int main(void)
         float active_torque = (fabsf(g_torque_from_loadcell_Nm) > 0.01f) ? fabsf(g_torque_from_loadcell_Nm) : g_torque_from_current_Nm;
         Encoder_Process(&h_encoder, (float)dt_ms, active_torque);
 
-        g_measured_speed_rpm = Encoder_GetRPM(&h_encoder);
         g_mechanical_power_w = Encoder_GetPower(&h_encoder);
 
-        USB_Comm_SendTelemetry(g_measured_current_mA, 
-                               g_torque_from_current_Nm, 
-                               g_torque_from_loadcell_Nm, 
+        /* Mô phỏng tải đường: Fw = m*a + 0.088*m + (0.000015*m + 0.02)*v_kmh^2 */
+        RoadLoad_SetParams(&h_road_load, g_vehicle_mass_kg, g_wheel_radius_m);
+        float road_torque_Nm = RoadLoad_Process(&h_road_load, Encoder_GetOmega(&h_encoder), (float)dt_ms / 1000.0f);
+
+        /* Tốc độ quay bánh xe = v / r */
+        g_measured_speed_rpm = h_road_load.wheel_rpm;
+        if (g_road_sim_enabled && USB_Comm_IsConnected()) {
+            if (road_torque_Nm > TJ_POD_MAX_TORQUE_NM) road_torque_Nm = TJ_POD_MAX_TORQUE_NM;
+            g_target_torque_Nm = road_torque_Nm;
+        }
+
+        USB_Comm_SendTelemetry(g_measured_current_mA,
+                               g_measured_current_mA * 0.001f * TORQUE_TO_CURRENT_KT,
+                               g_torque_from_loadcell_Nm,
                                g_pwm_duty_output,
                                g_measured_speed_rpm,
-                               g_mechanical_power_w);
+                               g_mechanical_power_w,
+                               h_road_load.v_kmh,
+                               h_road_load.force_n);
     }
     /* USER CODE END WHILE */
 

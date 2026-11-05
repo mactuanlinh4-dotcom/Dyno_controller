@@ -5,3 +5,6 @@ build/
 *.su
 *.o
 *.d
+# Python
+GUI/.venv/
+__pycache__/

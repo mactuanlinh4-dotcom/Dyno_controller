@@ -31,6 +31,12 @@ typedef enum {
 #define HX711_EMA_ALPHA         0.10f
 
 /**
+ * @brief Quá thời gian này (ms) không có dữ liệu => coi như đứt dây/lỗi
+ * (HX711 chậm nhất 10Hz = 100ms/mẫu)
+ */
+#define HX711_TIMEOUT_MS        500
+
+/**
  * @brief Giá trị Scale Factor mặc định (ADC counts / kg) trước khi Calib
  */
 #define HX711_1_SCALE_FACTOR    216560.0f  // Loadcell 1 (Bên Nén M+)
@@ -66,6 +72,7 @@ typedef struct {
     // Trạng thái hệ thống
     uint8_t      is_ready;          // 1: Dữ liệu đã sẵn sàng, 0: Đang bận
     uint8_t      is_connected;      // 1: Cảm biến hoạt động bình thường, 0: Đứt dây/Lỗi
+    uint32_t     last_ready_tick;   // Thời điểm (ms) lần cuối HX711 có dữ liệu
 } HX711_HandleTypeDef;
 
 /* ==================================================================== */

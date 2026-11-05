@@ -51,6 +51,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     APP/usb_comm/usb_comm.c
     APP/hx711/hx711.c
     APP/encoder/encoder.c
+    APP/road_load/road_load.c
 )
 
 # Add include paths
@@ -62,6 +63,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     APP/usb_comm
     APP/hx711
     APP/encoder
+    APP/road_load
 )
 
 # Add project symbols (macros)
